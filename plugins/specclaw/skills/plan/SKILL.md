@@ -16,7 +16,7 @@ Turn an approved proposal into an executable plan.
 
 1. **Validate:** run `specclaw-validate-change .specclaw <change> plan`. If it fails, report missing prerequisites and stop.
 2. Read `.specclaw/changes/<change>/proposal.md`.
-3. Analyze the existing codebase (file structure, patterns, dependencies relevant to the change).
+3. Analyze the existing codebase (file structure, patterns, dependencies relevant to the change). **Also read `.specclaw/context.md` if it exists** — it contains project-level coding rules, patterns, architecture decisions, and constraints; apply them throughout spec, design, and tasks generation.
 4. Generate three files in `.specclaw/changes/<change>/`:
    - `spec.md` — functional requirements, non-functional requirements, acceptance criteria, edge cases.
      - **If `--author-spec` is set:** invoke the `spec-author` subagent via the `Agent` tool with `subagent_type: "spec-author"` to author the spec interactively. After the agent writes the file, **STOP and require explicit user approval** (e.g. "approved", "yes", "go") before proceeding to `design.md` and `tasks.md`. Do not generate the remaining files until the user approves.

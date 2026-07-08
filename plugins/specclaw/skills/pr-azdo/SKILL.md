@@ -14,4 +14,9 @@ Create an Azure DevOps PR for a verified change.
    - **Test policy:** same gate as `/specclaw:pr` — prompts once, enforces on all runs.
    - **PR creation:** builds title (≤128 chars) from `proposal.md`, description from `spec.md` + `verify-report.md`, calls ADO REST API.
    - **Saves URL:** appends `**ADO PR:** <url>` to `status.md`.
-3. Report the ADO PR URL to the user.
+3. **Update project context:** After the ADO PR URL is saved, rewrite `.specclaw/context.md` to incorporate decisions from this change:
+   - Run `specclaw-update-context .specclaw <change>` — this outputs an LLM prompt.
+   - Feed the prompt to a coding agent that rewrites `context.md` in place (architecture-doc style: replaces stale info, merges new decisions).
+   - If `context.md` changed, commit it: `git add .specclaw/context.md && git commit -m "docs(context): update project context after <change>"` and push.
+   - Errors here are non-blocking — warn and continue.
+4. Report the ADO PR URL to the user.

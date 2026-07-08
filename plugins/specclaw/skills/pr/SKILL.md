@@ -25,4 +25,9 @@ Create a GitHub PR for a verified change. Requires `verify-report.md` (build + v
    - **PR creation:** builds title from `proposal.md`, body from `spec.md` + `verify-report.md`, runs `gh pr create --base main`.
    - **GitHub sync:** if `github.sync: true`, includes `Closes #N` in the PR body.
    - **Saves URL:** appends `**PR:** <url>` to `status.md`.
-3. Report the PR URL to the user.
+3. **Update project context:** After the PR URL is saved, rewrite `.specclaw/context.md` to incorporate decisions from this change:
+   - Run `specclaw-update-context .specclaw <change>` — this outputs an LLM prompt.
+   - Feed the prompt to a coding agent that rewrites `context.md` in place (architecture-doc style: replaces stale info, merges new decisions).
+   - If `context.md` changed, commit it: `git add .specclaw/context.md && git commit -m "docs(context): update project context after <change>"` and push.
+   - Errors here are non-blocking — warn and continue.
+4. Report the PR URL to the user.
