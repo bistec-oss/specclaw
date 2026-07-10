@@ -9,7 +9,7 @@ description: Create an Azure DevOps pull request for a verified change. Mirrors 
 Create an Azure DevOps PR for a verified change.
 
 1. **Validate:** `specclaw-validate-change .specclaw <change> pr`. Fails if `verify-report.md` is missing.
-2. **Run:** `specclaw-azdo-pr .specclaw <change>`
+2. **Run:** `specclaw-azdo-pr .specclaw <change>` — **always** create the PR through this script, never hand-roll the ADO REST call. `specclaw-azdo-pr` stages and commits the full `.specclaw/changes/<change>/` planning trail (proposal, spec, design, tasks, status, verify-report) into the branch and **aborts if any of it is left uncommitted** — bypassing it ships a PR missing the proposal artifacts.
    - Requires `AZDO_TOKEN`, `AZDO_ORG`, `AZDO_PROJECT`, `AZDO_REPO` (set via `/specclaw:auth-azdo`).
    - **Test policy:** same gate as `/specclaw:pr` — prompts once, enforces on all runs.
    - **PR creation:** builds title (≤128 chars) from `proposal.md`, description from `spec.md` + `verify-report.md`, calls ADO REST API.
