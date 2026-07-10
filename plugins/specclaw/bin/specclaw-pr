@@ -601,15 +601,20 @@ main() {
   # Use `git status --porcelain` (not `git diff HEAD`) so untracked new files
   # are detected — `git diff HEAD` only shows changes to already-tracked files.
   local change_path="${SPECCLAW_DIR}/changes/${CHANGE_NAME}"
-  if [[ -d "$change_path" ]] && [[ -z "$(git status --porcelain "$change_path" 2>/dev/null)" ]]; then
-    : # nothing to add (working tree clean for this dir — no modified or untracked files)
-  elif [[ -d "$change_path" ]]; then
+  if [[ -d "$change_path" ]] && [[ -n "$(git status --porcelain "$change_path" 2>/dev/null)" ]]; then
     echo "Staging .specclaw/changes/${CHANGE_NAME}/ artifacts for the PR…"
     git add "$change_path" 2>/dev/null || true
     if ! git diff --cached --quiet -- "$change_path" 2>/dev/null; then
       git commit -m "specclaw(${CHANGE_NAME}): include .specclaw/ planning + verify artifacts in PR" \
         --only -- "$change_path" >/dev/null 2>&1 || true
     fi
+  fi
+  # Hard constraint: the planning trail MUST be committed before the PR opens.
+  # If anything under the change dir is still uncommitted (staging or commit
+  # failed above), abort rather than open a PR missing the proposal artifacts.
+  # .env is gitignored so it never appears here.
+  if [[ -d "$change_path" ]] && [[ -n "$(git status --porcelain "$change_path" 2>/dev/null)" ]]; then
+    die "planning artifacts under $change_path are not committed — refusing to open a PR without the proposal trail. Commit them (git add '$change_path' && git commit) and re-run."
   fi
   # Push any new commits to the remote branch so the PR sees them
   git push 2>/dev/null || true
