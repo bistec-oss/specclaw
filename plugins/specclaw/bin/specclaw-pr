@@ -622,6 +622,24 @@ main() {
   # Step 7: Save URL
   save_pr_url "$pr_url"
 
+  # Step 8: Update project context (always-on; errors are non-blocking)
+  local update_context_script="$SCRIPT_DIR/specclaw-update-context"
+  if [[ -x "$update_context_script" ]]; then
+    local context_prompt
+    context_prompt="$("$update_context_script" "$SPECCLAW_DIR" "$CHANGE_NAME" 2>/dev/null)" || true
+    if [[ -n "$context_prompt" ]]; then
+      local context_file="$SPECCLAW_DIR/context.md"
+      local project_root
+      project_root="$(cd "$SPECCLAW_DIR/.." && pwd)"
+      # The calling skill (pr/pr-azdo) feeds this prompt to a coding agent that rewrites context.md.
+      # Here in the bash script we record the prompt for the skill to consume; actual LLM rewrite
+      # happens in the skill's step after this script exits.
+      echo "__CONTEXT_UPDATE_PROMPT_START__"
+      printf '%s' "$context_prompt"
+      echo "__CONTEXT_UPDATE_PROMPT_END__"
+    fi
+  fi
+
   echo "✅ PR created: $pr_url"
 }
 

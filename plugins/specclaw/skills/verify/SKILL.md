@@ -16,6 +16,8 @@ specclaw-validate-change .specclaw <change> verify
 
 If it fails (tasks not all complete), report and stop.
 
+**If `.specclaw/context.md` exists**, read it before evaluating — the verifier must check that the implementation respects the project's coding rules, patterns, and constraints documented there, in addition to the spec's acceptance criteria.
+
 ## Step 1 — Collect evidence
 
 ```bash

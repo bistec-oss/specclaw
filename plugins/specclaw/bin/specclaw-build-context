@@ -228,6 +228,24 @@ $(cat "$KNOWLEDGE_HINTS_FILE")
 "
 fi
 
+# --- Project context (living architecture doc) ---
+MAX_CONTEXT_LINES=150
+CONTEXT_FILE="$SPECCLAW_DIR/context.md"
+CONTEXT_SECTION=""
+if [[ -f "$CONTEXT_FILE" ]]; then
+  local_line_count="$(wc -l < "$CONTEXT_FILE")"
+  if [[ "$local_line_count" -gt "$MAX_CONTEXT_LINES" ]]; then
+    CONTEXT_SECTION="## Project Context
+*(Truncated: showing first $MAX_CONTEXT_LINES of $local_line_count lines — see .specclaw/context.md for full doc)*
+$(head -n "$MAX_CONTEXT_LINES" "$CONTEXT_FILE")
+"
+  else
+    CONTEXT_SECTION="## Project Context
+$(cat "$CONTEXT_FILE")
+"
+  fi
+fi
+
 # --- Existing file contents ---
 build_file_contents() {
   local file_list="$1"
@@ -348,7 +366,7 @@ fi
 cat <<PROMPT
 You are a coding agent implementing a specific task in the project "${PROJECT_NAME}".
 
-${GUARDRAILS_SECTION}${KNOWLEDGE_SECTION}
+${GUARDRAILS_SECTION}${KNOWLEDGE_SECTION}${CONTEXT_SECTION}
 ## Your Task
 ${TASK_TITLE}
 ${TASK_NOTES}
