@@ -47,8 +47,13 @@ Subcommands (implemented):
                 and emit JSON {tripped, test_files:[...], action, message}. Exits
                 0 (clean, tripped=false) or 3 (guard tripped → turn rejected).
 
+  escalate      <specclaw_dir> <change_name> "<reason>"
+                Controlled halt. Commit partial work (git.commit_prefix), preserve
+                state per git.strategy (worktree/branch kept; direct → warn), append
+                an ## Escalation section to loop-log.md with a fresh gate snapshot,
+                and print an operator notification block to stdout. Exit 0.
+
 Subcommands (planned — not yet implemented):
-  escalate      Commit partial work, keep worktree, emit halt notification.
   ci-poll       Poll remote CI checks (gh / az) for the opt-in outer loop.
 
 Options:
@@ -840,6 +845,175 @@ cmd_guard_tests() {
   return 3
 }
 
+# ─── Subcommand: escalate ────────────────────────────────────────────────────
+#
+# Called when a halt condition fires (cap / regression / no-progress /
+# oscillation). This is a CONTROLLED stop, not a script error — exit 0.
+#
+# Steps:
+#   1. Commit partial work with the configured git.commit_prefix. If there is
+#      nothing to commit, skip (do not error).
+#   2. Preserve state per git.strategy:
+#        worktree-per-change → worktree stays; note its path.
+#        branch-per-change   → branch is preserved; note the branch.
+#        direct              → WARN no isolated worktree; work is on current branch.
+#   3. Finalize loop-log.md: append an ## Escalation section with timestamp,
+#      the reason, and a fresh gate-status snapshot (reuses cmd_gates).
+#   4. Emit an operator notification block to stdout (Discord-pasteable).
+#
+# Reuses: cmd_gates (snapshot), yaml_val (config), json_escape (n/a here),
+# and the same loop-log append style as cmd_log_turn / cmd_guard_tests.
+
+# Render a fresh gate snapshot as a one-line-per-gate human summary.
+# Sets (nameref) the summary text; echoes nothing. Parses the JSON cmd_gates
+# emits (one gate per line) with the same per-line grep approach as
+# cmd_signature, so no jq is needed.
+escalate_gate_summary() {
+  local -n _sum_ref="$1"
+  local gates_json="$2"
+  local out="" line name green errors
+  while IFS= read -r line; do
+    case "$line" in
+      *'"name":'*'"green":'*) : ;;
+      *) continue ;;
+    esac
+    name=$(printf '%s' "$line" \
+      | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/') || true
+    green=$(printf '%s' "$line" \
+      | grep -oE '"green"[[:space:]]*:[[:space:]]*(true|false)' \
+      | grep -oE '(true|false)' || true)
+    errors=$(printf '%s' "$line" \
+      | sed -E 's/.*"errors"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/') || true
+    local mark="RED" ; [ "$green" = "true" ] && mark="GREEN"
+    local suffix=""
+    if [ "$green" != "true" ] && [ -n "$errors" ]; then
+      suffix=" — ${errors}"
+    fi
+    out="${out}  - ${name}: ${mark}${suffix}
+"
+  done <<< "$gates_json"
+  _sum_ref=$(printf '%s' "$out" | sed -E 's/[[:space:]]+$//')
+}
+
+cmd_escalate() {
+  local specclaw_dir="$1"
+  local change_name="$2"
+  local reason="$3"
+  local change_dir="${specclaw_dir}/changes/${change_name}"
+  local config_file="${specclaw_dir}/config.yaml"
+  local log_file="${change_dir}/loop-log.md"
+
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # ── Read config: commit_prefix (default "specclaw") + strategy ───────────────
+  local commit_prefix="" strategy="" worktree_dir=""
+  if [ -f "$config_file" ]; then
+    commit_prefix=$(yaml_val "$config_file" "git.commit_prefix")
+    strategy=$(yaml_val "$config_file" "git.strategy")
+    worktree_dir=$(yaml_val "$config_file" "git.worktree_dir")
+  fi
+  [ -z "$commit_prefix" ] && commit_prefix="specclaw"
+  [ -z "$strategy" ] && strategy="branch-per-change"
+
+  # ── Resolve repo root (run git from there so relative paths are consistent) ──
+  local repo_root
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || repo_root="$(pwd)"
+
+  # ── 1. Commit partial work (tolerate "nothing to commit") ────────────────────
+  # Stage all working-tree changes, then commit only if the staged index differs
+  # from HEAD. `git diff --cached --quiet` exits 1 when there is something staged.
+  local commit_note="" commit_msg="${commit_prefix}(${change_name}): loop escalation — partial work preserved"
+  ( cd "$repo_root" && git add -A ) 2>/dev/null || warn "git add -A failed (continuing)"
+  local staged_dirty=0
+  ( cd "$repo_root" && git diff --cached --quiet ) || staged_dirty=$?
+  if [ "$staged_dirty" -ne 0 ]; then
+    if ( cd "$repo_root" && git commit -m "$commit_msg" ) >/dev/null 2>&1; then
+      local sha
+      sha=$( ( cd "$repo_root" && git rev-parse --short HEAD ) 2>/dev/null || true )
+      commit_note="committed partial work (${sha}): ${commit_msg}"
+    else
+      commit_note="commit attempted but failed (see git output); work left in working tree"
+      warn "escalate: git commit failed"
+    fi
+  else
+    commit_note="nothing to commit — working tree already clean"
+  fi
+
+  # ── 2. State preservation per git.strategy ───────────────────────────────────
+  local branch
+  branch=$( ( cd "$repo_root" && git rev-parse --abbrev-ref HEAD ) 2>/dev/null || echo "unknown" )
+  local location_note=""
+  case "$strategy" in
+    worktree-per-change)
+      # The worktree stays — nothing destructive. Note its path (best effort).
+      local wt_path=""
+      [ -n "$worktree_dir" ] && wt_path="${worktree_dir}/${change_name}"
+      if [ -n "$wt_path" ]; then
+        location_note="worktree preserved at ${wt_path} (branch ${branch})"
+      else
+        location_note="worktree preserved (branch ${branch})"
+      fi
+      ;;
+    direct)
+      warn "escalate: git.strategy=direct — no isolated worktree; work committed to current branch ${branch}"
+      location_note="no isolated worktree (git.strategy=direct); work committed to current branch ${branch}"
+      ;;
+    branch-per-change|*)
+      location_note="branch ${branch} preserved"
+      ;;
+  esac
+
+  # ── 3. Fresh gate snapshot ───────────────────────────────────────────────────
+  local gates_json=""
+  gates_json=$(cmd_gates "$specclaw_dir" "$change_name" 2>/dev/null) || true
+  local all_green=""
+  all_green=$(printf '%s' "$gates_json" \
+    | grep -oE '"all_green"[[:space:]]*:[[:space:]]*(true|false)' \
+    | head -1 | grep -oE '(true|false)' || true)
+  local passing_count=""
+  passing_count=$(printf '%s' "$gates_json" \
+    | grep -oE '"passing_count"[[:space:]]*:[[:space:]]*[0-9]+' \
+    | head -1 | grep -oE '[0-9]+' || true)
+  [ -z "$passing_count" ] && passing_count="?"
+  local gate_summary=""
+  escalate_gate_summary gate_summary "$gates_json"
+  [ -z "$gate_summary" ] && gate_summary="  - (no gate snapshot available)"
+
+  # ── 4. Finalize loop-log.md (append ## Escalation) ───────────────────────────
+  if [ -d "$change_dir" ] || mkdir -p "$change_dir" 2>/dev/null; then
+    {
+      printf '%s\n\n' $'\n## Escalation'
+      printf '%s%s\n' '- **Timestamp:** ' "$now"
+      printf '%s%s\n' '- **Reason:** ' "$reason"
+      printf '%s%s\n' '- **State:** ' "$commit_note"
+      printf '%s%s\n' '- **Location:** ' "$location_note"
+      printf '%s%s\n\n' '- **Passing gates:** ' "${passing_count} / 4"
+      printf '%s\n' '### Gate status snapshot'
+      printf '%s\n' ''
+      printf '%s\n' "$gate_summary"
+    } >> "$log_file"
+  fi
+
+  # ── Operator notification (stdout, Discord-pasteable) ────────────────────────
+  cat <<EOF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🛑 LOOP HALTED — ${change_name}
+Reason: ${reason}
+Passing gates: ${passing_count} / 4
+
+Gate status:
+${gate_summary}
+
+State: ${commit_note}
+Where: ${location_note}
+Log: ${log_file}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+
+  return 0
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -874,6 +1048,10 @@ case "${1:-}" in
   guard-tests)
     [ $# -ge 3 ] || die "Usage: specclaw-loop guard-tests <specclaw_dir> <change_name>"
     cmd_guard_tests "$2" "$3"
+    ;;
+  escalate)
+    [ $# -ge 4 ] || die "Usage: specclaw-loop escalate <specclaw_dir> <change_name> <reason>"
+    cmd_escalate "$2" "$3" "$4"
     ;;
   "")
     usage
