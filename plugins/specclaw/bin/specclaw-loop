@@ -26,10 +26,21 @@ Subcommands (implemented):
   done          <specclaw_dir> <change_name>
                 Print the final PASS summary block for an operator notification.
 
+  signature     <specclaw_dir> <change_name>
+                Compute the failure signature (sha1 of sorted red-gate names +
+                normalized error fingerprint) from a fresh gates evaluation.
+                Emits the hex sha1 to stdout, or empty string if all gates green.
+
+  decide        <specclaw_dir> <change_name> <passing_count> <failure_sig>
+                Check caps / regression / no-progress / oscillation and emit
+                JSON {action:"continue"|"halt", reason:"..."}.
+
+  log-turn      <specclaw_dir> <change_name> <passing_count> <failure_sig> \
+                <action> "<reflection>" "<gates_summary>"
+                Append a turn entry to loop-log.md and update loop-state.json.
+
 Subcommands (planned — not yet implemented):
-  decide        Check caps / no-progress / regression / oscillation → continue|halt.
   guard-tests   Reject a fix turn that touched test files (reward-hack guard).
-  log-turn      Append a turn entry to loop-log.md and update loop-state.json.
   escalate      Commit partial work, keep worktree, emit halt notification.
   ci-poll       Poll remote CI checks (gh / az) for the opt-in outer loop.
 
@@ -308,6 +319,298 @@ Turns: ${turn}
 EOF
 }
 
+# ─── Subcommand: signature ───────────────────────────────────────────────────
+#
+# failure_sig = sha1( sorted(red_gate_names) + normalized_error_fingerprint )
+#
+# Runs a fresh `gates` evaluation, extracts the names + errors of every red
+# gate, normalizes the errors so "same error, different run" collapses to one
+# signature (strip line numbers, hex addresses, ISO-8601 timestamps), and emits
+# the hex sha1 to stdout. If all gates are green, emits an empty string.
+cmd_signature() {
+  local specclaw_dir="$1"
+  local change_name="$2"
+
+  # Fresh gate evaluation. Guard against nonzero so set -e never aborts here.
+  local gates_json=""
+  gates_json=$(cmd_gates "$specclaw_dir" "$change_name" 2>/dev/null) || true
+
+  # If all gates green → no failure → empty signature.
+  local all_green=""
+  all_green=$(printf '%s' "$gates_json" \
+    | grep -oE '"all_green"[[:space:]]*:[[:space:]]*(true|false)' \
+    | head -1 | grep -oE '(true|false)' || true)
+  if [ "$all_green" = "true" ]; then
+    printf ''
+    return 0
+  fi
+
+  # Extract the red gates: walk each gate object, pull name + green + errors.
+  # Each gate is one line in the emitted JSON, so a per-line grep is reliable.
+  local red_names="" red_errors=""
+  local line name green errors
+  while IFS= read -r line; do
+    case "$line" in
+      *'"name":'*'"green":'*) : ;;   # a gate line
+      *) continue ;;
+    esac
+    name=$(printf '%s' "$line" \
+      | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/') || true
+    green=$(printf '%s' "$line" \
+      | grep -oE '"green"[[:space:]]*:[[:space:]]*(true|false)' \
+      | grep -oE '(true|false)' || true)
+    [ "$green" = "false" ] || continue
+    errors=$(printf '%s' "$line" \
+      | sed -E 's/.*"errors"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/') || true
+    red_names="${red_names}${name}
+"
+    red_errors="${red_errors}${errors}
+"
+  done <<< "$gates_json"
+
+  # Sorted red-gate names.
+  local sorted_names=""
+  sorted_names=$(printf '%s' "$red_names" | grep -v '^$' | sort | tr '\n' ' ' \
+    | sed -E 's/[[:space:]]+$//') || true
+
+  # Normalized error fingerprint: strip line-number noise, hex addresses, and
+  # ISO-8601 timestamps so the same failure across runs collapses to one sig.
+  local norm_errors=""
+  norm_errors=$(printf '%s' "$red_errors" \
+    | sed -E 's/0x[0-9a-fA-F]+/0xADDR/g' \
+    | sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.,][0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?/TIMESTAMP/g' \
+    | sed -E 's/:[0-9]+:[0-9]+/:LINE:COL/g' \
+    | sed -E 's/:[0-9]+\b/:LINE/g' \
+    | sed -E 's/\bline[[:space:]]+[0-9]+/line N/gi' \
+    | sed -E 's/[0-9]+/N/g') || true
+
+  # Compute sha1 of the combined fingerprint.
+  local fingerprint sig
+  fingerprint="${sorted_names}
+${norm_errors}"
+  sig=$(printf '%s' "$fingerprint" | sha1sum | cut -d' ' -f1) || true
+  printf '%s' "$sig"
+}
+
+# ─── Subcommand: decide ────────────────────────────────────────────────────────
+#
+# Read loop-state.json + config, apply halt precedence, emit
+# {"action":"continue"|"halt","reason":"..."}.
+#
+# Halt precedence (checked in this exact order):
+#   1. CAP         — next turn > loop.max_iterations
+#   2. REGRESSION  — passing_count < prev_passing (prev set/>0)
+#   3. NO-PROGRESS — last no_progress_limit sigs (incl. this one) identical+nonempty
+#   4. OSCILLATION — A→B→A flip (sig == sig_history[-2]) OR sig occurs >= limit times
+#   5. continue
+cmd_decide() {
+  local specclaw_dir="$1"
+  local change_name="$2"
+  local passing_count="$3"
+  local failure_sig="$4"
+  local change_dir="${specclaw_dir}/changes/${change_name}"
+  local state_file="${change_dir}/loop-state.json"
+  local config_file="${specclaw_dir}/config.yaml"
+
+  # ── Read state (flat JSON this script writes itself → tolerant grep/sed) ──────
+  local turn=0 prev_passing=0 sig_hist_raw=""
+  if [ -f "$state_file" ]; then
+    local t p
+    t=$(grep -oE '"turn"[[:space:]]*:[[:space:]]*[0-9]+' "$state_file" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+' || true)
+    [ -n "$t" ] && turn="$t"
+    p=$(grep -oE '"passing_count"[[:space:]]*:[[:space:]]*[0-9]+' "$state_file" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+' || true)
+    [ -n "$p" ] && prev_passing="$p"
+    # sig_history array contents (between the [ ]).
+    sig_hist_raw=$(grep -oE '"sig_history"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$state_file" 2>/dev/null \
+        | head -1 | sed -E 's/.*\[([^]]*)\].*/\1/' || true)
+  fi
+
+  # sig_history as a newline-delimited list (order preserved).
+  local sig_list=""
+  if [ -n "$sig_hist_raw" ]; then
+    sig_list=$(printf '%s' "$sig_hist_raw" \
+      | grep -oE '"[^"]*"' | sed -E 's/^"//; s/"$//') || true
+  fi
+
+  # ── Read config caps (defaults 5 / 2) ────────────────────────────────────────
+  local max_iterations="" no_progress_limit=""
+  if [ -f "$config_file" ]; then
+    max_iterations=$(yaml_val "$config_file" "loop.max_iterations")
+    no_progress_limit=$(yaml_val "$config_file" "loop.no_progress_limit")
+  fi
+  [ -z "$max_iterations" ] && max_iterations=5
+  [ -z "$no_progress_limit" ] && no_progress_limit=2
+
+  local next_turn=$((turn + 1))
+
+  emit_decision() {
+    printf '{"action": "%s", "reason": "%s"}\n' "$1" "$(json_escape "$2")"
+  }
+
+  # ── 1. CAP ────────────────────────────────────────────────────────────────────
+  if [ "$next_turn" -gt "$max_iterations" ]; then
+    emit_decision "halt" "iteration cap ${max_iterations} reached"
+    return 0
+  fi
+
+  # ── 2. REGRESSION ─────────────────────────────────────────────────────────────
+  if [ "$prev_passing" -gt 0 ] && [ "$passing_count" -lt "$prev_passing" ]; then
+    emit_decision "halt" "regression: passing gates dropped ${prev_passing}→${passing_count}"
+    return 0
+  fi
+
+  # ── 3. NO-PROGRESS ──────────────────────────────────────────────────────────
+  # The last (no_progress_limit) signatures — this turn's plus the tail of
+  # history — all identical and non-empty → no progress.
+  if [ -n "$failure_sig" ]; then
+    # Build the candidate window: history tail + this turn's sig.
+    local window=""
+    window=$(printf '%s\n%s' "$sig_list" "$failure_sig" | grep -v '^$' || true)
+    local window_count
+    window_count=$(printf '%s\n' "$window" | grep -c '^' || true)
+    [ -z "$window_count" ] && window_count=0
+    if [ "$window_count" -ge "$no_progress_limit" ]; then
+      # Take the last no_progress_limit entries and check they are all == failure_sig.
+      local tail_win uniq_count
+      tail_win=$(printf '%s\n' "$window" | tail -n "$no_progress_limit") || true
+      uniq_count=$(printf '%s\n' "$tail_win" | sort -u | grep -c '^' || true)
+      local all_match=""
+      all_match=$(printf '%s\n' "$tail_win" | grep -v -x -F "$failure_sig" || true)
+      if [ "$uniq_count" = "1" ] && [ -z "$all_match" ]; then
+        emit_decision "halt" "no progress: identical failure signature ${no_progress_limit} turns"
+        return 0
+      fi
+    fi
+  fi
+
+  # ── 4. OSCILLATION ────────────────────────────────────────────────────────────
+  # A→B→A: this sig equals the second-to-last history entry.
+  # OR the same sig has occurred >= no_progress_limit times across history.
+  if [ -n "$failure_sig" ]; then
+    local hist_count
+    hist_count=$(printf '%s\n' "$sig_list" | grep -v '^$' | grep -c '^' || true)
+    [ -z "$hist_count" ] && hist_count=0
+
+    # sig_history[-2] : the entry before the last.
+    local second_last=""
+    if [ "$hist_count" -ge 2 ]; then
+      second_last=$(printf '%s\n' "$sig_list" | grep -v '^$' | tail -n 2 | head -n 1) || true
+    fi
+
+    # Total occurrences of this sig in history (history already contains prior
+    # turns; if we also count this turn, an equal or exceeding limit trips).
+    local occ
+    occ=$(printf '%s\n' "$sig_list" | grep -v '^$' | grep -c -x -F "$failure_sig" || true)
+    [ -z "$occ" ] && occ=0
+    local occ_incl=$((occ + 1))
+
+    if [ "$second_last" = "$failure_sig" ] || [ "$occ_incl" -ge "$no_progress_limit" ]; then
+      emit_decision "halt" "oscillation detected"
+      return 0
+    fi
+  fi
+
+  # ── 5. continue ───────────────────────────────────────────────────────────────
+  emit_decision "continue" "gates red but progress possible (turn ${next_turn}/${max_iterations})"
+}
+
+# ─── Subcommand: log-turn ──────────────────────────────────────────────────────
+#
+# Append a `## Turn N` section to loop-log.md and rewrite loop-state.json.
+#
+# sig_history tracking: empty-string signatures (all-green turns) are NOT
+# appended to sig_history — only real failure signatures are tracked, so
+# no-progress / oscillation math never trips on green turns. An empty-diff turn
+# is surfaced by the caller passing the same (repeated) signature, which the
+# `decide` no-progress rule catches.
+cmd_log_turn() {
+  local specclaw_dir="$1"
+  local change_name="$2"
+  local passing_count="$3"
+  local failure_sig="$4"
+  local action="$5"
+  local reflection="$6"
+  local gates_summary="$7"
+  local change_dir="${specclaw_dir}/changes/${change_name}"
+  local state_file="${change_dir}/loop-state.json"
+  local log_file="${change_dir}/loop-log.md"
+
+  mkdir -p "$change_dir"
+
+  # ── Read current state ────────────────────────────────────────────────────────
+  local turn=0 ci_turn=0 sig_hist_raw=""
+  if [ -f "$state_file" ]; then
+    local t c
+    t=$(grep -oE '"turn"[[:space:]]*:[[:space:]]*[0-9]+' "$state_file" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+' || true)
+    [ -n "$t" ] && turn="$t"
+    c=$(grep -oE '"ci_turn"[[:space:]]*:[[:space:]]*[0-9]+' "$state_file" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+' || true)
+    [ -n "$c" ] && ci_turn="$c"
+    sig_hist_raw=$(grep -oE '"sig_history"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$state_file" 2>/dev/null \
+        | head -1 | sed -E 's/.*\[([^]]*)\].*/\1/' || true)
+  fi
+
+  local new_turn=$((turn + 1))
+
+  # ── Existing sig_history entries (preserve order) ─────────────────────────────
+  local sig_list=""
+  if [ -n "$sig_hist_raw" ]; then
+    sig_list=$(printf '%s' "$sig_hist_raw" \
+      | grep -oE '"[^"]*"' | sed -E 's/^"//; s/"$//') || true
+  fi
+
+  # Append this turn's failure_sig only if non-empty (green turns leave history
+  # untouched — see the tracking note above).
+  local new_sig_list=""
+  if [ -n "$sig_list" ] && [ -n "$failure_sig" ]; then
+    new_sig_list=$(printf '%s\n%s' "$sig_list" "$failure_sig")
+  elif [ -n "$sig_list" ]; then
+    new_sig_list="$sig_list"
+  elif [ -n "$failure_sig" ]; then
+    new_sig_list="$failure_sig"
+  fi
+
+  # Build the JSON array body: ["a","b",...]
+  local arr_body=""
+  if [ -n "$new_sig_list" ]; then
+    local s
+    while IFS= read -r s; do
+      [ -z "$s" ] && continue
+      if [ -n "$arr_body" ]; then
+        arr_body="${arr_body}, \"$(json_escape "$s")\""
+      else
+        arr_body="\"$(json_escape "$s")\""
+      fi
+    done <<< "$new_sig_list"
+  fi
+
+  # ── Append the turn section to loop-log.md ────────────────────────────────────
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local sig_display="$failure_sig"
+  [ -z "$sig_display" ] && sig_display="(none — all gates green)"
+  # Note: printf format strings must not begin with a literal '-' (parsed as a
+  # flag), so every line's format starts with '%s' carrying the leading text.
+  {
+    printf '%s%s\n\n' $'\n## Turn ' "$new_turn"
+    printf '%s%s\n' '- **Timestamp:** ' "$now"
+    printf '%s%s\n' '- **Passing gates:** ' "${passing_count} / 4"
+    printf '%s%s%s\n' '- **Failure signature:** `' "$sig_display" '`'
+    printf '%s%s\n\n' '- **Decision:** ' "$action"
+    printf '%s%s\n\n' $'### Gate summary\n\n' "$gates_summary"
+    printf '%s%s\n' $'### Reflection\n\n' "$reflection"
+  } >> "$log_file"
+
+  # ── Rewrite loop-state.json (valid flat JSON via printf) ──────────────────────
+  printf '{"turn": %s, "passing_count": %s, "sig_history": [%s], "ci_turn": %s}\n' \
+    "$new_turn" "$passing_count" "$arr_body" "$ci_turn" > "$state_file"
+
+  echo "Logged turn ${new_turn} (passing ${passing_count}/4, action ${action})"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -326,6 +629,18 @@ case "${1:-}" in
   done)
     [ $# -ge 3 ] || die "Usage: specclaw-loop done <specclaw_dir> <change_name>"
     cmd_done "$2" "$3"
+    ;;
+  signature)
+    [ $# -ge 3 ] || die "Usage: specclaw-loop signature <specclaw_dir> <change_name>"
+    cmd_signature "$2" "$3"
+    ;;
+  decide)
+    [ $# -ge 5 ] || die "Usage: specclaw-loop decide <specclaw_dir> <change_name> <passing_count> <failure_sig>"
+    cmd_decide "$2" "$3" "$4" "$5"
+    ;;
+  log-turn)
+    [ $# -ge 8 ] || die "Usage: specclaw-loop log-turn <specclaw_dir> <change_name> <passing_count> <failure_sig> <action> <reflection> <gates_summary>"
+    cmd_log_turn "$2" "$3" "$4" "$5" "$6" "$7" "$8"
     ;;
   "")
     usage
