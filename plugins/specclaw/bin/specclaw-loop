@@ -53,8 +53,17 @@ Subcommands (implemented):
                 an ## Escalation section to loop-log.md with a fresh gate snapshot,
                 and print an operator notification block to stdout. Exit 0.
 
-Subcommands (planned — not yet implemented):
-  ci-poll       Poll remote CI checks (gh / az) for the opt-in outer loop.
+  ci-poll       <specclaw_dir> <change_name>
+                Opt-in outer CI loop primitive (only meaningful when
+                loop.ci_gate == true). Runs ONE poll cycle for the PR on the
+                current branch: blocks up to loop.ci_timeout_seconds (default
+                1200), sleeping between checks, until CI concludes or the
+                wall-clock is exceeded. The orchestrator skill owns the
+                multi-iteration loop + the fix cycle between polls; this
+                subcommand is a pure observation primitive. Provider is
+                auto-detected (GitHub preferred over Azure). Emits ONE JSON
+                object: {status, provider, failed_log, pr}. status is one of
+                green | red | timeout | no-checks | disabled | none. Exit 0.
 
 Options:
   -h, --help    Show this help message
@@ -1014,6 +1023,287 @@ EOF
   return 0
 }
 
+# ─── Subcommand: ci-poll ─────────────────────────────────────────────────────
+#
+# Opt-in outer CI loop primitive. Poll the remote CI checks for the PR on the
+# CURRENT branch ONCE — i.e. this invocation blocks (in-session) up to
+# loop.ci_timeout_seconds, sleeping between checks, until CI concludes (green /
+# red) or the wall-clock is exceeded. The orchestrator skill owns the
+# multi-iteration loop (ci_turn 1..ci_max_iterations) and the fix cycle between
+# polls; this subcommand stays a pure decision/observation primitive.
+#
+# Provider detection + precedence:
+#   GitHub  — if `gh` CLI is available AND (github.sync true OR github.repo set
+#             OR an origin remote points at github.com). Preferred if both
+#             providers look viable.
+#   Azure   — else if azdo.enabled is true AND `az` CLI is available.
+#   none    — if neither the needed CLI nor config is present. Emits
+#             {"status":"none","provider":"none",...} + a warn, exit 0 (never
+#             hard-fail on a missing CLI).
+#
+# Status values (exactly one emitted):
+#   green      — checks concluded successfully.
+#   red        — checks concluded with a failure; failed_log carries the tail
+#                of the failed-run log.
+#   no-checks  — after a short grace period (CI_GRACE_SECONDS) NO checks are
+#                reported for the PR. Per the "no pipeline attached → treat as
+#                green after grace" edge case: distinctly labeled so the skill
+#                logs a warning and proceeds.
+#   timeout    — wall-clock exceeded ci_timeout_seconds before checks concluded
+#                (hung pipeline).
+#   disabled   — loop.ci_gate is not true (feature off). Exit 0 immediately.
+#   none       — required CLI / provider config missing.
+#
+# All gh/az/grep calls are `|| true`-guarded so a CLI error never aborts the
+# script — every path resolves to one JSON status object. failed_log is
+# json_escaped. pr is the PR number (GitHub) or the branch name (fallback).
+
+# Poll/grace/sleep knobs (wall-clock in seconds).
+CI_SLEEP_SECONDS=20      # interval between poll iterations
+CI_GRACE_SECONDS=60      # window to wait for any check to appear before "no-checks"
+
+# Emit the single ci-poll JSON result. Args: status provider failed_log pr
+ci_emit() {
+  local status="$1" provider="$2" failed_log="$3" pr="$4"
+  printf '{"status": "%s", "provider": "%s", "failed_log": "%s", "pr": "%s"}\n' \
+    "$status" "$provider" "$(json_escape "$failed_log")" "$(json_escape "$pr")"
+}
+
+cmd_ci_poll() {
+  local specclaw_dir="$1"
+  local change_name="$2"
+  local config_file="${specclaw_dir}/config.yaml"
+
+  # ── Gate: only meaningful when loop.ci_gate == true ──────────────────────────
+  local ci_gate=""
+  [ -f "$config_file" ] && ci_gate=$(yaml_val "$config_file" "loop.ci_gate")
+  if [ "$ci_gate" != "true" ]; then
+    ci_emit "disabled" "none" "" ""
+    return 0
+  fi
+
+  # ── Read caps / knobs (defaults 3 / 1200) ────────────────────────────────────
+  local ci_max_iterations="" ci_timeout_seconds=""
+  if [ -f "$config_file" ]; then
+    ci_max_iterations=$(yaml_val "$config_file" "loop.ci_max_iterations")
+    ci_timeout_seconds=$(yaml_val "$config_file" "loop.ci_timeout_seconds")
+  fi
+  [ -z "$ci_max_iterations" ] && ci_max_iterations=3
+  [ -z "$ci_timeout_seconds" ] && ci_timeout_seconds=1200
+  # ci_max_iterations is owned by the orchestrator skill (multi-poll loop); read
+  # here only so a bad value never surprises the operator. Not used for control.
+  : "$ci_max_iterations"
+
+  # ── Current branch (source of the PR under test) ─────────────────────────────
+  local branch=""
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || true
+  [ -z "$branch" ] && branch="HEAD"
+
+  # ── Provider detection (GitHub preferred over Azure) ─────────────────────────
+  # GitHub is viable if gh is installed AND we have a github signal:
+  #   github.sync true | github.repo set | origin remote is github.com.
+  local gh_ok=false az_ok=false
+  local github_sync="" github_repo="" azdo_enabled=""
+  if [ -f "$config_file" ]; then
+    github_sync=$(yaml_val "$config_file" "github.sync")
+    github_repo=$(yaml_val "$config_file" "github.repo")
+    azdo_enabled=$(yaml_val "$config_file" "azdo.enabled")
+  fi
+  local origin_url=""
+  origin_url=$(git remote get-url origin 2>/dev/null) || true
+
+  if command -v gh >/dev/null 2>&1; then
+    if [ "$github_sync" = "true" ] || [ -n "$github_repo" ] \
+       || printf '%s' "$origin_url" | grep -qi 'github\.com'; then
+      gh_ok=true
+    fi
+  fi
+  if [ "$azdo_enabled" = "true" ] && command -v az >/dev/null 2>&1; then
+    az_ok=true
+  fi
+
+  local provider="none"
+  if $gh_ok; then
+    provider="github"
+  elif $az_ok; then
+    provider="azure"
+  fi
+
+  # ── No provider / missing CLI → non-fatal none ───────────────────────────────
+  if [ "$provider" = "none" ]; then
+    warn "ci-poll: no CI provider available (gh/az missing or github.*/azdo.enabled unset) — treating as none"
+    ci_emit "none" "none" "" "$branch"
+    return 0
+  fi
+
+  # ── Wall-clock setup ─────────────────────────────────────────────────────────
+  local start_ts now_ts elapsed
+  start_ts=$(date +%s)
+
+  if [ "$provider" = "github" ]; then
+    ci_poll_github "$branch" "$start_ts" "$ci_timeout_seconds"
+    return 0
+  else
+    ci_poll_azure "$branch" "$start_ts" "$ci_timeout_seconds"
+    return 0
+  fi
+}
+
+# GitHub poll cycle. Args: branch start_ts timeout_seconds
+# Resolves the PR from the current branch, polls `gh pr checks`, and on a red
+# conclusion pulls `gh run view --log-failed`. Emits ONE JSON status.
+ci_poll_github() {
+  local branch="$1" start_ts="$2" timeout_seconds="$3"
+
+  # Resolve the PR number for the current branch (best-effort).
+  local pr_num=""
+  pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null) || true
+  [ -z "$pr_num" ] && pr_num=$(gh pr view "$branch" --json number --jq '.number' 2>/dev/null) || true
+  local pr_ref="$pr_num"
+  [ -z "$pr_ref" ] && pr_ref="$branch"
+
+  local now_ts elapsed
+  while :; do
+    # `gh pr checks` exit codes: 0 = all passed, 8 = pending, nonzero (e.g. 1) =
+    # failure, and it errors when NO checks exist. Capture output + rc; guard rc.
+    local checks_out="" checks_rc=0
+    checks_out=$(gh pr checks "$pr_ref" 2>&1) || checks_rc=$?
+
+    now_ts=$(date +%s)
+    elapsed=$((now_ts - start_ts))
+
+    # No checks reported for the PR. `gh pr checks` prints a "no checks reported"
+    # message and exits nonzero. After the grace window → treat as no-checks.
+    if printf '%s' "$checks_out" | grep -qiE 'no checks reported|no check runs'; then
+      if [ "$elapsed" -ge "$CI_GRACE_SECONDS" ]; then
+        warn "ci-poll(github): no checks reported for PR ${pr_ref} after grace — treating as no-checks (green-ish)"
+        ci_emit "no-checks" "github" "" "$pr_ref"
+        return 0
+      fi
+      # still inside grace → fall through to sleep/timeout handling below.
+    else
+      # Parse the per-check states. `gh pr checks` prints TSV rows with a state
+      # column (pass|fail|pending|skipping|...). Determine aggregate outcome.
+      local n_pending n_fail n_total
+      n_total=$(printf '%s\n' "$checks_out" | grep -ciE 'pass|fail|pending|skipping|neutral|cancel' || true)
+      n_pending=$(printf '%s\n' "$checks_out" | grep -ciE '\bpending\b|in_progress|queued' || true)
+      n_fail=$(printf '%s\n' "$checks_out" | grep -ciE '\bfail\b|failing|error|cancel' || true)
+      [ -z "$n_total" ] && n_total=0
+      [ -z "$n_pending" ] && n_pending=0
+      [ -z "$n_fail" ] && n_fail=0
+
+      # Prefer gh's own exit code when it is decisive (0 pass / 8 pending),
+      # falling back to the parsed row states.
+      if [ "$checks_rc" -eq 0 ] && [ "$n_total" -gt 0 ] && [ "$n_pending" -eq 0 ] && [ "$n_fail" -eq 0 ]; then
+        ci_emit "green" "github" "" "$pr_ref"
+        return 0
+      fi
+      if [ "$n_pending" -eq 0 ] && [ "$n_total" -gt 0 ]; then
+        if [ "$n_fail" -gt 0 ]; then
+          # Concluded red → pull failed-run logs (tail only).
+          local failed_log=""
+          failed_log=$(gh run view --log-failed 2>/dev/null | tail -100) || true
+          [ -z "$failed_log" ] && failed_log=$(printf '%s' "$checks_out" | tail -40)
+          ci_emit "red" "github" "$failed_log" "$pr_ref"
+          return 0
+        fi
+        # No pending, no fail, but rc nonzero — treat as green (all resolved).
+        ci_emit "green" "github" "" "$pr_ref"
+        return 0
+      fi
+      # else: still pending → fall through to sleep/timeout.
+    fi
+
+    # ── Wall-clock timeout (hung pipeline) ─────────────────────────────────────
+    now_ts=$(date +%s)
+    elapsed=$((now_ts - start_ts))
+    if [ "$elapsed" -ge "$timeout_seconds" ]; then
+      local tail_log=""
+      tail_log=$(printf '%s' "$checks_out" | tail -40)
+      warn "ci-poll(github): wall-clock timeout (${timeout_seconds}s) before checks concluded"
+      ci_emit "timeout" "github" "$tail_log" "$pr_ref"
+      return 0
+    fi
+
+    sleep "$CI_SLEEP_SECONDS"
+  done
+}
+
+# Azure poll cycle. Args: branch start_ts timeout_seconds
+# Uses `az pipelines runs list` filtered to the branch, then `az pipelines runs
+# show` for status/result. Emits ONE JSON status.
+ci_poll_azure() {
+  local branch="$1" start_ts="$2" timeout_seconds="$3"
+  local pr_ref="$branch"
+  local branch_ref="refs/heads/${branch}"
+
+  local now_ts elapsed
+  while :; do
+    # Latest run for this branch. `--query` pulls id/status/result of the newest.
+    # az emits JSON; parse with grep/sed (no jq dependency in this controller).
+    local runs_out="" runs_rc=0
+    runs_out=$(az pipelines runs list --branch "$branch_ref" --top 1 --output json 2>/dev/null) || runs_rc=$?
+
+    now_ts=$(date +%s)
+    elapsed=$((now_ts - start_ts))
+
+    # No run found for the branch → within grace, keep polling; after grace,
+    # treat as no-checks (no pipeline attached).
+    if [ -z "$runs_out" ] || printf '%s' "$runs_out" | grep -qE '^\[\s*\]\s*$'; then
+      if [ "$elapsed" -ge "$CI_GRACE_SECONDS" ]; then
+        warn "ci-poll(azure): no pipeline run for branch ${branch} after grace — treating as no-checks (green-ish)"
+        ci_emit "no-checks" "azure" "" "$pr_ref"
+        return 0
+      fi
+    else
+      # status: notStarted|inProgress|completed ; result: succeeded|failed|canceled|partiallySucceeded
+      local status="" result=""
+      status=$(printf '%s' "$runs_out" | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+               | sed -E 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/') || true
+      result=$(printf '%s' "$runs_out" | grep -oE '"result"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+               | sed -E 's/.*"result"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/') || true
+
+      if [ "$status" = "completed" ]; then
+        case "$result" in
+          succeeded)
+            ci_emit "green" "azure" "" "$pr_ref"
+            return 0
+            ;;
+          failed|canceled|partiallySucceeded)
+            # Pull a failing log summary from the run (best-effort).
+            local run_id="" failed_log=""
+            run_id=$(printf '%s' "$runs_out" | grep -oE '"id"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 \
+                     | grep -oE '[0-9]+') || true
+            if [ -n "$run_id" ]; then
+              failed_log=$(az pipelines runs show --id "$run_id" --output json 2>/dev/null | tail -100) || true
+            fi
+            [ -z "$failed_log" ] && failed_log="azure pipeline run ${run_id:-?} result=${result}"
+            ci_emit "red" "azure" "$failed_log" "$pr_ref"
+            return 0
+            ;;
+          *)
+            # Completed but unknown result → treat as green-ish resolved.
+            ci_emit "green" "azure" "" "$pr_ref"
+            return 0
+            ;;
+        esac
+      fi
+      # else: notStarted / inProgress → still running, fall through to timeout.
+    fi
+
+    # ── Wall-clock timeout (hung pipeline) ─────────────────────────────────────
+    now_ts=$(date +%s)
+    elapsed=$((now_ts - start_ts))
+    if [ "$elapsed" -ge "$timeout_seconds" ]; then
+      warn "ci-poll(azure): wall-clock timeout (${timeout_seconds}s) before pipeline concluded"
+      ci_emit "timeout" "azure" "" "$pr_ref"
+      return 0
+    fi
+
+    sleep "$CI_SLEEP_SECONDS"
+  done
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -1052,6 +1342,10 @@ case "${1:-}" in
   escalate)
     [ $# -ge 4 ] || die "Usage: specclaw-loop escalate <specclaw_dir> <change_name> <reason>"
     cmd_escalate "$2" "$3" "$4"
+    ;;
+  ci-poll)
+    [ $# -ge 3 ] || die "Usage: specclaw-loop ci-poll <specclaw_dir> <change_name>"
+    cmd_ci_poll "$2" "$3"
     ;;
   "")
     usage
