@@ -19,7 +19,7 @@ Open an issue on GitHub with:
    - `plugins/specclaw/.claude-plugin/plugin.json`
    - `.claude-plugin/marketplace.json` (the `"specclaw"` entry)
    Commit as `chore: bump version to X.Y.Z`.
-5. Test with OpenClaw: install the skill locally and run through the workflow
+5. Test with Claude Code: install the plugin from your local checkout and run through the lifecycle
 6. Commit with conventional commits: `feat: add X`, `fix: resolve Y`
 7. Open a PR with a clear description
 
@@ -30,7 +30,14 @@ git clone https://github.com/chan4lk/specclaw.git
 cd specclaw
 ```
 
-The skill is in `skill/` — test by symlinking or copying to your OpenClaw skills directory.
+The plugin lives in `plugins/specclaw/` (skills, agents, templates, references, tests). To test your changes locally, add the checkout as a marketplace and install from it inside Claude Code:
+
+```
+/plugin marketplace add /path/to/specclaw
+/plugin install specclaw@chan4lk
+```
+
+Then run the workflow (`/specclaw:init`, `/specclaw:propose`, ...) in a scratch project.
 
 ### What We Need Help With
 
