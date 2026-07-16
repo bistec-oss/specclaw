@@ -1,7 +1,7 @@
 # 🦞 SpecClaw Dashboard
 
 **Project:** specclaw
-**Last Updated:** 2026-07-16 10:10 UTC
+**Last Updated:** 2026-07-16 14:54 UTC
 
 ## Active Changes
 
@@ -13,6 +13,7 @@
 - 🔨 **code-reviewer-agent** — 5/6 tasks (83%) | 0 failed
 - ✅ **git-worktrees** — 3/3 tasks (100%) | 0 failed
 - ✅ **github-issues-sync** — 3/3 tasks (100%) | 0 failed
+- ✅ **grounded-context** — 6/6 tasks (100%) | 0 failed
 - ✅ **karpathy-build-guardrails** — 6/6 tasks (100%) | 0 failed
 - ✅ **learn-command** — 2/2 tasks (100%) | 0 failed
 - ✅ **lifecycle-bug-fixes** — 8/8 tasks (100%) | 0 failed
@@ -21,6 +22,8 @@
 - ✅ **phase-validation** — 2/2 tasks (100%) | 0 failed
 - ✅ **post-build-review** — 1/1 tasks (100%) | 0 failed
 - ✅ **pr-command** — 7/7 tasks (100%) | 0 failed
+- ✅ **prompt-hardening** — 6/6 tasks (100%) | 0 failed
+- ✅ **smart-base-branch** — 4/4 tasks (100%) | 0 failed
 - 🔨 **spec-author-agent** — 4/5 tasks (80%) | 0 failed
 - ✅ **update-check** — 4/4 tasks (100%) | 0 failed
 - ✅ **verification-engine** — 4/4 tasks (100%) | 0 failed
@@ -35,6 +38,6 @@ _None._
 
 ## Stats
 
-- **Total changes:** 18
-- **Active:** 18
+- **Total changes:** 21
+- **Active:** 21
 - **Completed:** 0

@@ -168,6 +168,89 @@ fi
 echo
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Case 6 — grounded-context: specclaw-discover-context ranking, filtering,
+# budget, and off-switch (all jq-free; runs in a non-git temp tree, which also
+# exercises the find fallback).
+# ─────────────────────────────────────────────────────────────────────────────
+echo "--- Case 6: discover-context ranking / filtering / budget ---"
+DISCOVER="$BIN_DIR/specclaw-discover-context"
+if [[ ! -f "$DISCOVER" ]]; then
+  fail "discover-context script missing at $DISCOVER"
+else
+  # Fixture project: copy the static tree, add a .specclaw dir per sub-case.
+  DPROJ="$WORK/discovery-proj"
+  mkdir -p "$DPROJ/.specclaw"
+  cp -R "$FIXTURES_DIR/discovery/." "$DPROJ/"
+  printf 'context:\n  discovery: true\n' > "$DPROJ/.specclaw/config.yaml"
+
+  # 6a (AC1/AC2) — ranking: llms.txt-listed guide.md first (tier 1), root
+  # canonical CLAUDE/README (tier 2), nested src/README (tier 4).
+  paths="$(bash "$DISCOVER" "$DPROJ/.specclaw" list 2>/dev/null | cut -f3 | tr '\n' ',')"
+  assert_eq "6a ranked order" "docs/guide.md,CLAUDE.md,README.md,docs/skip.md,src/README.md," "$paths"
+
+  # 6b (AC2) — missing llms.txt entry warns but does not fail.
+  if bash "$DISCOVER" "$DPROJ/.specclaw" list 2>&1 >/dev/null | grep -q "docs/nope.md"; then
+    pass "6b llms.txt missing entry warned"
+  else
+    fail "6b llms.txt missing entry warned"
+  fi
+
+  # 6c (AC3) — defaults exclude CHANGELOG.md and archive/.
+  listed="$(bash "$DISCOVER" "$DPROJ/.specclaw" list 2>/dev/null | cut -f3)"
+  if grep -q "CHANGELOG.md" <<<"$listed" || grep -q "archive/old.md" <<<"$listed"; then
+    fail "6c default exclusions (CHANGELOG/archive leaked)"
+  else
+    pass "6c default exclusions"
+  fi
+
+  # 6d (AC4) — precedence: folders includes docs/, exclude still beats it;
+  # root-relative pattern excludes root README.
+  printf 'context:\n  discovery: true\n  folders:\n    - "docs"\n  exclude:\n    - "docs/skip.md"\n' > "$DPROJ/.specclaw/config.yaml"
+  paths="$(bash "$DISCOVER" "$DPROJ/.specclaw" list 2>/dev/null | cut -f3 | tr '\n' ',')"
+  assert_eq "6d exclude beats folders" "docs/guide.md," "$paths"
+  printf 'context:\n  discovery: true\n  exclude:\n    - "./README.md"\n    - "src"\n' > "$DPROJ/.specclaw/config.yaml"
+  paths="$(bash "$DISCOVER" "$DPROJ/.specclaw" list 2>/dev/null | cut -f3 | tr '\n' ',')"
+  assert_eq "6d root-relative + segment excludes" "docs/guide.md,CLAUDE.md,docs/skip.md," "$paths"
+
+  # 6e (AC5) — budget: emit stays within budget and names every casualty.
+  printf 'context:\n  discovery: true\n' > "$DPROJ/.specclaw/config.yaml"
+  out="$(bash "$DISCOVER" "$DPROJ/.specclaw" emit --budget 4 2>/dev/null)"
+  if grep -q '^<!-- dropped (over 4-line budget):' <<<"$out"; then
+    pass "6e budget footer present"
+  else
+    fail "6e budget footer present"
+  fi
+  # Budget 4: guide.md (2) + CLAUDE.md (2) fit exactly; the rest must be
+  # named as dropped. " README.md" (leading space) avoids matching src/README.md.
+  for casualty in " README.md" "docs/skip.md" "src/README.md"; do
+    if grep "^<!-- dropped" <<<"$out" | grep -q "$casualty"; then
+      pass "6e names dropped:$casualty"
+    else
+      fail "6e names dropped:$casualty"
+    fi
+  done
+
+  # 6f (AC6) — discovery off: zero output, exit 0.
+  printf 'context:\n  discovery: false\n' > "$DPROJ/.specclaw/config.yaml"
+  out="$(bash "$DISCOVER" "$DPROJ/.specclaw" emit 2>/dev/null)"; rc=$?
+  if [[ -z "$out" && "$rc" -eq 0 ]]; then
+    pass "6f discovery off = empty output, exit 0"
+  else
+    fail "6f discovery off = empty output, exit 0 (rc=$rc, ${#out} bytes)"
+  fi
+
+  # 6g — git enumeration path: run against the real repo, expect README.md
+  # (tier 2) present and .specclaw/ absent.
+  real_list="$(bash "$DISCOVER" "$REPO_ROOT/.specclaw" list 2>/dev/null | cut -f3)"
+  if grep -qx "README.md" <<<"$real_list" && ! grep -q "^\.specclaw/" <<<"$real_list"; then
+    pass "6g git-tree enumeration on real repo"
+  else
+    fail "6g git-tree enumeration on real repo"
+  fi
+fi
+echo
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Case 8 — update-check: compare logic, gate, fail-silence, cache (all offline).
 # ─────────────────────────────────────────────────────────────────────────────
 echo "--- Case 8: update-check compare / gate / silence / cache ---"
@@ -240,6 +323,84 @@ else
     pass "8f unreachable host silent"
   else
     fail "8f unreachable host silent (rc=$rc, out: $out)"
+  fi
+fi
+echo
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Case 7 — smart-base-branch: detect_base_branch chain + base-aware setup.
+# Local bare origin with default branch 'develop'; jq-free asserts.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "--- Case 7: base branch detection + base-aware setup ---"
+BUILD_BIN="$BIN_DIR/specclaw-build"
+GPROJ="$WORK/base-branch-proj"
+
+# Build a bare origin whose default branch is 'develop'
+mkdir -p "$WORK/origin-src" && (
+  cd "$WORK/origin-src"
+  git init -q -b develop .
+  git config user.email t@t && git config user.name t
+  echo base > base.txt && git add . && git commit -qm base
+  echo dev2 > dev2.txt && git add . && git commit -qm dev2
+) && git clone -q --bare "$WORK/origin-src" "$WORK/origin.git" && (
+  git -C "$WORK/origin.git" symbolic-ref HEAD refs/heads/develop
+) && git clone -q "$WORK/origin.git" "$GPROJ" && (
+  cd "$GPROJ"
+  git config user.email t@t && git config user.name t
+  mkdir -p .specclaw/changes/bb-test
+  printf 'version: 1\ngit:\n  strategy: "branch-per-change"\n  branch_prefix: "specclaw/"\n' > .specclaw/config.yaml
+  printf '# t\n- [ ] `T1` — x\n  - Files: a\n' > .specclaw/changes/bb-test/tasks.md
+)
+
+if [[ ! -f "$BUILD_BIN" ]]; then
+  fail "specclaw-build missing"
+else
+  # 7a (AC1) — detection resolves origin/HEAD -> develop; setup JSON reports it
+  setup_json="$(cd "$GPROJ" && bash "$BUILD_BIN" setup .specclaw bb-test 2>/dev/null)"
+  base_val="$(printf '%s' "$setup_json" | grep -o '"base_branch": "[^"]*"' | sed 's/.*: "//;s/"//')"
+  assert_eq "7a detected base (origin/HEAD)" "develop" "$base_val"
+
+  # 7b (AC4) — new change branch starts at origin/develop tip
+  tip_origin="$(git -C "$GPROJ" rev-parse origin/develop)"
+  tip_branch="$(git -C "$GPROJ" rev-parse specclaw/bb-test)"
+  assert_eq "7b branch starts at origin/develop tip" "$tip_origin" "$tip_branch"
+
+  # 7c (AC5) — resume path unchanged (second run warns, same branch)
+  resume_out="$(cd "$GPROJ" && bash "$BUILD_BIN" setup .specclaw bb-test 2>&1 >/dev/null)"
+  if grep -q "already exists — resuming" <<<"$resume_out"; then
+    pass "7c resume warning intact"
+  else
+    fail "7c resume warning intact"
+  fi
+
+  # 7d (AC2) — config override beats origin/HEAD
+  (cd "$GPROJ" && git checkout -q develop && git branch -q -D specclaw/bb-test)
+  printf 'version: 1\ngit:\n  strategy: "branch-per-change"\n  branch_prefix: "specclaw/"\n  base_branch: "release/1.0"\n' > "$GPROJ/.specclaw/config.yaml"
+  (cd "$GPROJ" && git branch -q "release/1.0")
+  setup_json="$(cd "$GPROJ" && bash "$BUILD_BIN" setup .specclaw bb-test 2>/dev/null)"
+  base_val="$(printf '%s' "$setup_json" | grep -o '"base_branch": "[^"]*"' | sed 's/.*: "//;s/"//')"
+  assert_eq "7d config override wins" "release/1.0" "$base_val"
+
+  # 7e (AC3) — no origin remote: falls back to local main/master without error
+  NOREMOTE="$WORK/noremote-proj"
+  mkdir -p "$NOREMOTE" && (
+    cd "$NOREMOTE"
+    git init -q -b main .
+    git config user.email t@t && git config user.name t
+    echo x > x.txt && git add . && git commit -qm x
+    mkdir -p .specclaw/changes/nr-test
+    printf 'version: 1\ngit:\n  strategy: "branch-per-change"\n  branch_prefix: "specclaw/"\n' > .specclaw/config.yaml
+    printf '# t\n- [ ] `T1` — x\n  - Files: a\n' > .specclaw/changes/nr-test/tasks.md
+  )
+  setup_json="$(cd "$NOREMOTE" && bash "$BUILD_BIN" setup .specclaw nr-test 2>/dev/null)"
+  base_val="$(printf '%s' "$setup_json" | grep -o '"base_branch": "[^"]*"' | sed 's/.*: "//;s/"//')"
+  assert_eq "7e no-remote fallback" "main" "$base_val"
+
+  # 7f (AC6) — specclaw-pr uses detected base, no hardcoded '--base main'
+  if grep -q -- '--base "\$pr_base"' "$BIN_DIR/specclaw-pr" && ! grep -q -- '--base main' "$BIN_DIR/specclaw-pr"; then
+    pass "7f pr --base uses detection"
+  else
+    fail "7f pr --base uses detection"
   fi
 fi
 echo

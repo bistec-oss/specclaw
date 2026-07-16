@@ -80,3 +80,33 @@ Spec did not specify behavior when spec.md already exists and /specclaw:plan is 
 Resolved in T3 by adding explicit 'if spec.md exists, skip spec step' branch in plan/SKILL.md; should be backported into spec.md FR7 wording on a future iteration
 
 ---
+
+## [L6] agent_issue — specclaw-gh-sync create detects Issues disabled on the ta...
+
+**When:** 2026-07-16 09:01 UTC
+**Category:** agent_issue
+**Priority:** medium
+**Status:** pending
+
+### Detail
+specclaw-gh-sync create detects Issues disabled on the target repo and exits 0 with a skip warning, recording nothing in status.md. specclaw-validate-change plan/build gates then hard-fail (strict mode) on the missing 'GitHub Issue' line — a permanently unpassable gate while github.sync: true. Same condition treated as skip by one component, fatal by another.
+
+### Action
+validate-change should detect the issues-disabled condition, or gh-sync should record 'GitHub Issue: disabled' in status.md, so gates warn instead of block.
+
+---
+
+## [L7] design_gap — yaml_get in specclaw-build-context does not strip inline ...
+
+**When:** 2026-07-16 09:22 UTC
+**Category:** design_gap
+**Priority:** low
+**Status:** pending
+
+### Detail
+yaml_get in specclaw-build-context does not strip inline YAML comments — commit_prefix renders as '"specclaw"       # Prefix for auto-commits' inside coding-agent payload commit instructions. yaml_val in validate-change already handles this; yaml_get predates it.
+
+### Action
+Port yaml_val's comment-stripping into yaml_get (or reuse yaml_val) in a lifecycle-bug-fixes follow-up change.
+
+---

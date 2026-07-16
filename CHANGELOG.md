@@ -4,6 +4,73 @@ All notable changes to specclaw are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-07-16
+
+### Added
+- **Grounded context discovery.** New `specclaw-discover-context` script
+  auto-discovers project documentation repo-wide (`git ls-files` with a
+  `find` fallback) and injects a budget-capped digest into plan, build,
+  and verify payloads. Ranking honors a root `llms.txt`/`llms-full.txt`
+  index first, then canonical root docs, doc directories, nested
+  READMEs, and other markdown. Changelogs, licenses, code-of-conduct
+  files, `archive`/`deprecated`/`i18n` content, dependency directories,
+  and `.specclaw/` itself are excluded by default. Configured via a new
+  `context:` block (`discovery`, `max_lines`, `folders`, `pin`,
+  `exclude`) with Context7-style precedence: exclude → folders →
+  include; `pin` bypasses both. Every over-budget file is named in the
+  digest footer — nothing is dropped silently. `context.discovery:
+  false` restores the exact previous behavior.
+- **Plan phase grounding.** `/specclaw:plan` now builds a structured
+  codebase survey, reads the discovered-docs digest, applies promoted
+  `.specclaw/knowledge/spec-guidelines.md` (previously written by
+  `learn --promote` but never read), and records the docs it used in a
+  "Grounding sources" section of `design.md`.
+- **Discovery regression tests.** Case 6 in `run-parser-tests.sh` — 11
+  jq-free assertions over a static fixture tree covering ranking,
+  llms.txt priority, default exclusions, filter precedence, pattern
+  forms, budget accounting, the off switch, and git-tree enumeration.
+- **Smart base branch detection.** New `detect_base_branch()` (duplicated
+  into `specclaw-build` and `specclaw-pr` per the self-contained-script
+  convention) resolves the base as: `git.base_branch` config override →
+  `origin/HEAD` (self-healing via `git remote set-head origin --auto`) →
+  `gh repo view` default branch → `main`/`master` fallback. New config key
+  `git.base_branch` (empty = auto).
+
+### Changed
+- **Evidence-grounded agent payloads (prompt hardening).** Sourced from
+  Anthropic's and OpenAI's published prompt-engineering guides:
+  - Verify agent and code-reviewer now use quote-first verdicts — extract
+    the exact AC/code/test-output lines a judgment rests on before judging;
+    findings without quotable evidence are dropped.
+  - Build/fix payloads gain Working Rules: investigate before answering
+    (never speculate about unopened code), general-purpose solutions only
+    (tests verify correctness, they don't define it; report bad tests
+    instead of working around them), temp-file cleanup.
+  - Build payload reordered task-last: longform spec/design/code first,
+    task + constraints at the end (measured long-context win); guardrails
+    stay first for prompt-cache locality.
+  - Constraints now carry motivations (scope limit ↔ parallel-task
+    conflicts + design_gap auto-logging; tests ↔ verify gate evidence).
+  - Few-shot `<example>` pairs in agent-prompts.md (good/bad reviewer
+    finding, strong/weak acceptance criterion).
+  - Loop fix agents carry reversibility rules: no force-push, no
+    `git reset --hard`, no `--no-verify`, no destructive shortcuts to
+    green a gate — halt and escalate instead.
+  - spec-author gains research discipline: competing hypotheses,
+    confidence tracking, self-critique before the final write.
+  Karpathy guardrails section remains verbatim.
+### Fixed
+- **`specclaw-build setup` no longer branches from arbitrary HEAD.** New
+  change branches start from `origin/<base>` (fetched first, offline-safe
+  local fallback); creating a branch while off-base prints a divergence
+  warning so stacking is deliberate. Resume behavior unchanged. Setup JSON
+  gains a `base_branch` field.
+- **`specclaw-build finalize` merges into the detected base** instead of
+  guessing `main`-else-`master`.
+- **`specclaw-pr` no longer hardcodes `--base main`** — the PR targets the
+  detected base; the version-bump comparison now uses the same single
+  source of truth.
+
 ## [0.5.1] — 2026-07-16
 
 ### Added
@@ -16,7 +83,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Gate: `plugin.update_check` config key (default true; `false` = zero
   network calls). Offline test hook `--remote-version` covers the compare,
   gate, cache, and silence paths in the suite.
-
 ## [0.4.2] — 2026-05-24
 
 ### Fixed
