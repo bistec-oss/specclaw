@@ -113,6 +113,7 @@ models:
 
 git:
   strategy: "branch-per-change"   # or "direct", or "worktree-per-change"
+  base_branch: ""                 # empty = auto-detect (origin/HEAD → gh default → main/master)
   auto_commit: true
   commit_prefix: "specclaw"
 
@@ -140,17 +141,38 @@ workflow:
   strict: true
   code_review: false               # Spawn code-reviewer agent on /specclaw:verify
   code_review_block: false         # Block /specclaw:pr if code review finds BLOCK issues
+
+context:
+  discovery: true                  # Auto-discover project docs for phase payloads
+  max_lines: 3000                  # Line budget for injected docs
+  folders: []                      # Restrict discovery (empty = whole repo)
+  pin: []                          # Always-include paths
+  exclude: []                      # Patterns to skip
 ```
 
 ### Update Check
 
 `/specclaw:status` quietly checks the plugin repo for a newer published version (at most once per 24h, cached in `.specclaw/.update-check` — add it to your `.gitignore`) and shows a one-line upgrade hint when one exists. Fail-silent by design: network problems never affect any command. Set `plugin.update_check: false` in config.yaml for zero network calls. No other lifecycle command touches the network for this.
+### Grounded Context Discovery
+
+SpecClaw grounds its planning and review in the documentation your project already has. With `context.discovery: true` (the default), `specclaw-discover-context` scans the repo (`git ls-files`, so `.gitignore` is respected) and injects a budget-capped digest of your docs into the plan, build, and verify payloads — after the curated `.specclaw/context.md` and knowledge base, which always take priority.
+
+Candidates are ranked: files listed in a root **`llms.txt`** / `llms-full.txt` index first, then root canonical docs (`CLAUDE.md`, `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `ARCHITECTURE.md`, `CODE-CONVENTIONS.md`, `SECURITY.md`), then doc directories (`docs/`, `doc/`, `.github/`, `wiki/`), then nested `README.md`/`CLAUDE.md`, then other markdown. Changelogs, licenses, code-of-conduct files, `archive/`/`deprecated/`/`i18n/` content, dependency directories, and `.specclaw/` itself are excluded by default.
+
+Filter precedence per file: `exclude` match → out; `folders` non-empty and file outside → out; otherwise in. `pin` entries bypass filtering and ranking. Exclude patterns support simple names (`node_modules`), root-relative paths (`./x`), and globs (`*.gen.md`, `**/dist`). Over-budget files are never dropped silently — every casualty is named in the digest footer. `/specclaw:plan` records the docs it used in a "Grounding sources" section of `design.md`. Set `context.discovery: false` for the exact pre-discovery behavior.
+### Base Branch Detection
+
+Change branches fork from — and merges/PRs target — the repo's actual base branch, resolved as: `git.base_branch` config override → `origin/HEAD` (self-healing via `git remote set-head origin --auto`) → `gh` default branch → `main`/`master` fallback. New change branches start from `origin/<base>` (fetched, offline-safe), never silently from whatever HEAD happens to be; creating a branch while off-base prints a warning so stacking is always deliberate. Repos on `develop`, `trunk`, or release branches work without configuration; set `git.base_branch` explicitly to pin a release flow.
 
 ### Code Review
 
 Set `workflow.code_review: true` to enable an automated code review step inside `/specclaw:verify`. After the acceptance-criteria check, a `code-reviewer` agent reviews changed files across 10 dimensions (correctness, security, YAGNI, one-liner opportunities, naming, complexity, test quality, design adherence, scope creep, dead code) and writes `review-report.md` with `APPROVED`, `CHANGES_REQUESTED`, or `APPROVED_WITH_NOTES`.
 
 Set `workflow.code_review_block: true` to hard-block `/specclaw:pr` when the review verdict is `CHANGES_REQUESTED`. Defaults to `false` so existing projects are unaffected.
+
+### Evidence-Grounded Agent Payloads
+
+Agent prompts follow published prompt-engineering guidance from Anthropic and OpenAI: coding agents are instructed to investigate before answering (never speculate about unopened code) and to write general-purpose solutions (tests verify correctness, they don't define it); verify and review agents must quote the exact spec/code/output lines a verdict rests on — unquotable claims are dropped; payloads put longform context first and the task last; loop fix agents carry reversibility rules (no force-push, no `--no-verify`, no destructive shortcuts to green a gate).
 
 ## Workflow
 
